@@ -7,14 +7,12 @@ from datetime import datetime, timedelta, timezone
 import os
 
 def generate_tls_cert():
-    # יצירת מפתח פרטי (private key)
     private_key = rsa.generate_private_key(
         public_exponent=65537,
         key_size=2048,
         backend=default_backend()
     )
 
-    # הגדרת subject ו-issuer (אותו דבר כאן כי זה self-signed)
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COUNTRY_NAME, u"IL"),
         x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"Jerusalem"),
@@ -25,7 +23,6 @@ def generate_tls_cert():
 
     now = datetime.now(timezone.utc)
 
-    # יצירת תעודת X.509
     certificate = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -41,10 +38,8 @@ def generate_tls_cert():
         .sign(private_key, hashes.SHA256(), default_backend())
     )
 
-    # יצירת תיקיית tls אם לא קיימת
     os.makedirs("tls", exist_ok=True)
 
-    # שמירת המפתח והתעודה לקבצים
     with open("tls/key.pem", "wb") as f:
         f.write(
             private_key.private_bytes(
