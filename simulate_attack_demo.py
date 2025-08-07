@@ -8,8 +8,8 @@ class MaliciousClient(Client):
     def send_message(self, message):
         fake_sender_id = "C999"
         signed_message = f"{message}::SIGNED_BY_{fake_sender_id}"
-        print(f"[Malicious {self.client_id}] Sending forged message to {self.entry_server}: {signed_message}")
-        self.entry_server.receive_message(signed_message, self.client_id)
+        print(f"[Malicious {self.client_id}] Sending forged message to {self.server_list}: {signed_message}")
+        self.server_list.receive_message(signed_message, self.client_id)
 
 def main():
     servers = [MixServer(f"S{i}") for i in range(1, NUM_SERVERS + 1)]
