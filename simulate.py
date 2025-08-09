@@ -10,10 +10,10 @@ def main():
     for i in range(NUM_SERVERS - 1):
         servers[i].next_server = servers[i + 1]
 
-    clients = [Client(f"C{i}", entry_server=servers[0]) for i in range(1, NUM_CLIENTS + 1)]
+    clients = [Client(f"C{i}", servers) for i in range(1, NUM_CLIENTS + 1)]
 
     for client in clients:
-        client.send_message("Hello, Mixnet!")
+        client.send_message({"to": "C1", "message": "Hello, Mixnet!"})
 
 if __name__ == "__main__":
     main()

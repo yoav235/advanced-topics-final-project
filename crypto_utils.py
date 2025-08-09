@@ -2,7 +2,7 @@ import os
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 
 
 def decrypt_hybrid(private_key, payload: bytes) -> bytes:
@@ -60,3 +60,14 @@ def encrypt_hybrid(public_key, plaintext: bytes) -> bytes:
         )
     )
     return rsa_encrypted + tag + ciphertext
+
+def load_private_keys(server_ids, keys_dir="keys"):
+    key_folder = os.path.join(os.getcwd(), keys_dir)
+    private_keys = {}
+    for server_id in server_ids:
+        key_path = os.path.join(key_folder, f"{server_id}_priv.pem")
+        with open(key_path, "rb") as key_file:
+            private_key = serialization.load_pem_private_key(key_file.read(), password=None)
+            private_keys[server_id] = private_key
+
+    return private_keys

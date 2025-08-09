@@ -1,10 +1,11 @@
-from server.nope_utils import sign_message_with_nope
+# from server.nope_utils import sign_message_with_nope
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import serialization, hashes
 import json
 import base64
 import os
 import crypto_utils
+import random
 
 def load_private_keys(server_ids, keys_dir="keys"):
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +62,7 @@ class Client:
         for i, server_id in enumerate(reversed(path_ids)):
             next_hop = path_ids[::-1][i - 1] if i > 0 else "DEST"
             payload = {
+                "from": self.client_id,
                 "next": next_hop,
                 "payload": payload
             }
@@ -72,13 +74,14 @@ class Client:
 
 
     def send_message(self, message):
-        # TODO create path
-        payload = self.onion_encrypt(message, path_ids=[self.client_id], public_keys={})
-        signed_message = sign_message_with_nope(message, self.client_id)
-
+        chosen_servers = random.sample(self.server_list, 3)
+        message_path = [s.server_id for s in chosen_servers]
+        payload = self.onion_encrypt(message, message_path)
+        # signed_message = sign_message_with_nope(payload, self.client_id)
+        signed_message = payload
         print(f"[Client {self.client_id}] Sending message to {self.server_list}: {message}")
 
-        self.server_list.receive_message(signed_message, self.client_id, use_tls=True)
+        chosen_servers[0].receive_message(signed_message, self.client_id, use_tls=True)
 
 # testing encryption
 if __name__ == "__main__":

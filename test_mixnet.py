@@ -15,3 +15,6 @@ def test_malicious_client(capsys):
     output = captured.out
     assert "❌ Invalid NOPE signature! Message dropped." in output
     assert output.count("Final destination reached.") == 2
+
+
+def test_client_send_message(capsys):
