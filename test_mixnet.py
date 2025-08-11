@@ -18,3 +18,4 @@ def test_malicious_client(capsys):
 
 
 def test_client_send_message(capsys):
+    pass

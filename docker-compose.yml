@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  mix1:
+    build: .
+    container_name: mix1
+    command: python -m server.server S1
+    networks:
+      - mixnet
+  mix2:
+    build: .
+    container_name: mix2
+    command: python -m server.server S2
+    networks:
+      - mixnet
+    depends_on:
+      - mix1
+  mix3:
+    build: .
+    container_name: mix3
+    command: python -m server.server S3
+    networks:
+      - mixnet
+    depends_on:
+      - mix2
+  client:
+    build: .
+    container_name: client
+    command: python -m client.client C1 mix1
+    networks:
+      - mixnet
+    depends_on:
+      - mix1
+
+networks:
+  mixnet:
+    driver: bridge
