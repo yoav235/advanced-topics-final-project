@@ -61,6 +61,7 @@ def encrypt_hybrid(public_key, plaintext: bytes) -> bytes:
     )
     return rsa_encrypted + tag + ciphertext
 
+
 def load_private_keys(server_ids, keys_dir="keys"):
     key_folder = os.path.join(os.getcwd(), keys_dir)
     private_keys = {}
@@ -71,3 +72,16 @@ def load_private_keys(server_ids, keys_dir="keys"):
             private_keys[server_id] = private_key
 
     return private_keys
+
+
+def load_public_key(path):
+    """
+    Load a public key from a PEM file.
+    :param path: Path to the PEM file
+    :return: The loaded public key object
+    """
+    full_path = "./keys/" + path + "_pub.pem"
+    with open(full_path, "rb") as key_file:
+        key_data = key_file.read()
+        public_key = serialization.load_pem_public_key(key_data)
+    return public_key
