@@ -78,6 +78,7 @@ class Client:
         message_path = [s.server_id for s in chosen_servers]
         payload = self.onion_encrypt(message, message_path)
         # signed_message = sign_message_with_nope(payload, self.client_id)
+        # todo: which client receives the message
         signed_message = payload
         print(f"[Client {self.client_id}] Sending message to {self.server_list}: {message}")
 

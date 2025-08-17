@@ -1,82 +1,132 @@
 # server/nope_utils.py
-import os
-import hmac
-import json
+# -*- coding: utf-8 -*-
+"""
+NOPE utils — no-ZK edition
+
+מה יש כאן:
+1) תמיכה בשני פורמטים של טוקן
+   a) JSON חתום (RSA-PSS-SHA256) — הפורמט החדש:
+      File: nope/tokens/<SID>.nope.json
+      {
+        "payload": {
+          "server_id": "...",
+          "domain": "...",
+          "pubkey_fingerprint": "<hex sha256(SPKI)>",
+          "alg": "RSA-PSS-SHA256",
+          "ts": <unix>
+        },
+        "signature_b64": "<base64(signature)>"
+      }
+      החתימה היא על JSON קנוני של payload (sort_keys + separators).
+
+   b) Legacy HMAC (תאימות לאחור):
+      token_b64 = base64(JSON{payload, mac_b64})
+      payload   = {"domain": "...", "pubkey_b64": base64(DER(SPKI))}
+      mac       = HMAC-SHA256(secret(domain), canonical_json(payload))
+      secret    = nope/authority_secrets/<domain>.key (נוצר אם חסר)
+
+2) פונקציות עיקריות לשימוש:
+   - find_token_for_server(server_id, ...)
+   - verify_nope_token_file(token_path, server_id, domain, public_key)
+   - verify_peer_nope(server_id, domain, public_key)  # עטיפת נוחות
+   - verify_nope_and_optional_zk(...)                 # shim: מאמת רק טוקן
+
+אין יותר תלות ב-ZK/‏snarkjs/‏VK/‏Proofs. אם קיימים קריאות ישנות
+ל־verify_nope_and_optional_zk, הן ימשיכו לעבוד—הפונקציה מתעלמת מפרמטרי ZK.
+"""
+
+from __future__ import annotations
+
 import base64
 import hashlib
-from typing import Optional
+import hmac
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Optional, Union
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-"""
-NOPE utils (dual-mode):
-- Legacy (HMAC): token is base64(JSON{payload, mac_b64}); payload has
-  {"domain": ..., "pubkey_b64": base64(DER(pubkey))} and MAC=HMAC-SHA256 over payload
-  using per-domain secret in nope/authority_secrets/<domain>.key
-- JSON RSA-PSS (current init_nope.py): file *.nope.json with
-  {"payload": {..., "server_id", "domain", "pubkey_fingerprint", "alg"}, "signature_b64": ...}
-  Signature is RSA-PSS-SHA256 by the server's private key; verified with its public key.
-"""
+# --------------------------------------------------------------------------------------
+# תצורה בסיסית של לוגינג (לא כופה פורמט; ישתלב בלוגינג של האפליקציה אם מוגדר)
+# --------------------------------------------------------------------------------------
+log = logging.getLogger(__name__)
 
-NOPE_DIR = os.environ.get("NOPE_DIR", "nope")
-AUTH_DIR = os.path.join(NOPE_DIR, "authority_secrets")
-os.makedirs(AUTH_DIR, exist_ok=True)
+# --------------------------------------------------------------------------------------
+# נתיבים
+# --------------------------------------------------------------------------------------
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+NOPE_DIR     = Path(os.environ.get("NOPE_DIR", PROJECT_ROOT / "nope"))
+AUTH_DIR     = NOPE_DIR / "authority_secrets"
+TOKENS_DIR   = NOPE_DIR / "tokens"
+
+AUTH_DIR.mkdir(parents=True, exist_ok=True)
+TOKENS_DIR.mkdir(parents=True, exist_ok=True)
+
+# --------------------------------------------------------------------------------------
+# עזר: JSON קנוני לבייטים (לחתימה/אימות)
+# --------------------------------------------------------------------------------------
+def _canonical_json_bytes(obj: object) -> bytes:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
-# ---------- helpers (legacy HMAC) ----------
-def _auth_key_path(domain: str) -> str:
+# ======================================================================================
+#                                 Legacy HMAC token
+# ======================================================================================
+
+def _auth_key_path(domain: str) -> Path:
     safe = domain.replace("/", "_")
-    return os.path.join(AUTH_DIR, f"{safe}.key")
+    return AUTH_DIR / f"{safe}.key"
 
 
 def ensure_domain_secret(domain: str) -> bytes:
-    """Create or load per-domain secret (simulating DNSSEC-bound issuer)."""
-    path = _auth_key_path(domain)
-    if not os.path.exists(path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        secret = os.urandom(32)
-        with open(path, "wb") as f:
-            f.write(secret)
-    else:
-        with open(path, "rb") as f:
-            secret = f.read()
-    return secret
+    """יוצר/טוען סוד פר-דומיין (מדמה מנפיק תלוי-DNSSEC)."""
+    p = _auth_key_path(domain)
+    if not p.exists():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(os.urandom(32))
+    return p.read_bytes()
 
 
 def make_nope_proof(domain: str, server_pubkey_der: bytes) -> str:
-    """Legacy HMAC token creation (kept for compatibility)."""
+    """יוצר טוקן HMAC ישן (לשמירת תאימות לאחור)."""
     secret = ensure_domain_secret(domain)
     payload = {
         "domain": domain,
         "pubkey_b64": base64.b64encode(server_pubkey_der).decode("ascii"),
     }
-    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    mac = hmac.new(secret, raw, hashlib.sha256).digest()
+    mac = hmac.new(secret, _canonical_json_bytes(payload), hashlib.sha256).digest()
     token = {"payload": payload, "mac_b64": base64.b64encode(mac).decode("ascii")}
     return base64.b64encode(json.dumps(token).encode("utf-8")).decode("ascii")
 
 
 def verify_nope_proof(token_b64: str, expected_domain: str, server_pubkey_der: bytes) -> bool:
-    """Legacy HMAC verification (kept for compatibility)."""
+    """מאמת טוקן HMAC ישן."""
     try:
         token = json.loads(base64.b64decode(token_b64).decode("utf-8"))
         payload = token["payload"]
         mac_b64 = token["mac_b64"]
+
         if payload.get("domain") != expected_domain:
             return False
         if payload.get("pubkey_b64") != base64.b64encode(server_pubkey_der).decode("ascii"):
             return False
+
         secret = ensure_domain_secret(expected_domain)
-        raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        expected_mac = hmac.new(secret, raw, hashlib.sha256).digest()
+        expected_mac = hmac.new(secret, _canonical_json_bytes(payload), hashlib.sha256).digest()
         return hmac.compare_digest(expected_mac, base64.b64decode(mac_b64))
     except Exception:
         return False
 
 
-# ---------- helpers (RSA-PSS JSON) ----------
+# ======================================================================================
+#                             JSON token (RSA-PSS, current)
+# ======================================================================================
+
 def pubkey_fingerprint(public_key) -> str:
+    """SHA-256 על SPKI (DER) של המפתח הציבורי."""
     der = public_key.public_bytes(
         serialization.Encoding.DER,
         serialization.PublicFormat.SubjectPublicKeyInfo,
@@ -87,18 +137,19 @@ def pubkey_fingerprint(public_key) -> str:
 
 
 def verify_nope_json(token_obj: dict, expected_sid: str, expected_domain: str, server_public_key) -> bool:
+    """אימות טוקן JSON חתום RSA-PSS-SHA256."""
     try:
         payload = token_obj["payload"]
         sig_b64 = token_obj["signature_b64"]
+
         if payload.get("server_id") != expected_sid:
             return False
         if payload.get("domain") != expected_domain:
             return False
-        # fingerprint must match the actual server public key
         if payload.get("pubkey_fingerprint") != pubkey_fingerprint(server_public_key):
             return False
 
-        payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        payload_bytes = _canonical_json_bytes(payload)
         signature = base64.b64decode(sig_b64)
 
         server_public_key.verify(
@@ -112,31 +163,37 @@ def verify_nope_json(token_obj: dict, expected_sid: str, expected_domain: str, s
         return False
 
 
-# ---------- main loader that supports both formats ----------
-def verify_nope_token_file(token_path: str, server_id: str, expected_domain: str, server_public_key) -> bool:
+# ======================================================================================
+#                           טעינת טוקן מאחסון ואימותו
+# ======================================================================================
+
+PathLike = Union[str, Path]
+
+def verify_nope_token_file(token_path: PathLike,
+                           server_id: str,
+                           expected_domain: str,
+                           server_public_key) -> bool:
     """
-    Detect token type by content/extension and verify accordingly.
-    Returns True if token is valid for (server_id, expected_domain, server_public_key).
+    מזהה אוטומטית את סוג הטוקן (JSON חתום / HMAC ישן) ומאמת בהתאם.
+    מחזיר True אם הטוקן תואם ל-(server_id, expected_domain, server_public_key).
     """
-    if not os.path.exists(token_path):
+    p = Path(token_path)
+    if not p.exists():
+        log.debug("Token file not found: %s", p)
         return False
 
+    # ניסיון ראשון: JSON חדש
     try:
-        # Try JSON first (current format *.nope.json)
-        with open(token_path, "r", encoding="utf-8") as f:
-            maybe_json = f.read().strip()
-        try:
-            token_obj = json.loads(maybe_json)
-            # JSON token should have "payload" and "signature_b64"
-            if isinstance(token_obj, dict) and "payload" in token_obj and "signature_b64" in token_obj:
-                return verify_nope_json(token_obj, server_id, expected_domain, server_public_key)
-        except json.JSONDecodeError:
-            pass
+        text = p.read_text(encoding="utf-8").strip()
+        obj = json.loads(text)
+        if isinstance(obj, dict) and "payload" in obj and "signature_b64" in obj:
+            return verify_nope_json(obj, server_id, expected_domain, server_public_key)
+    except Exception:
+        pass
 
-        # Fallback: legacy base64 token
-        with open(token_path, "rb") as f_bin:
-            raw = f_bin.read().strip()
-        token_b64 = raw.decode("utf-8")
+    # נפילה לאחור: Base64 של טוקן HMAC
+    try:
+        token_b64 = p.read_text(encoding="utf-8").strip()
         server_pub_der = server_public_key.public_bytes(
             encoding=serialization.Encoding.DER,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
@@ -144,3 +201,72 @@ def verify_nope_token_file(token_path: str, server_id: str, expected_domain: str
         return verify_nope_proof(token_b64, expected_domain, server_pub_der)
     except Exception:
         return False
+
+
+def find_token_for_server(server_id: str,
+                          prefer_json: bool = True,
+                          tokens_dir: Path | None = None) -> Optional[Path]:
+    """
+    מחפש nope/tokens/<SID>.nope.json (מועדף) או nope/tokens/<SID>.tok.
+    """
+    tdir = Path(tokens_dir) if tokens_dir else TOKENS_DIR
+    json_path = tdir / f"{server_id}.nope.json"
+    b64_path  = tdir / f"{server_id}.tok"
+    if prefer_json and json_path.exists():
+        return json_path
+    if b64_path.exists():
+        return b64_path
+    if json_path.exists():
+        return json_path
+    return None
+
+
+def verify_peer_nope(server_id: str,
+                     expected_domain: str,
+                     server_public_key,
+                     tokens_dir: Path | None = None) -> bool:
+    """
+    עטיפת נוחות: מאתר את הטוקן עבור השרת ומאמת אותו.
+    """
+    token_path = find_token_for_server(server_id, tokens_dir=tokens_dir)
+    if not token_path:
+        log.warning("Token for %s not found under %s", server_id, tokens_dir or TOKENS_DIR)
+        return False
+    ok = verify_nope_token_file(token_path, server_id, expected_domain, server_public_key)
+    if ok:
+        log.info("✅ NOPE token OK for %s (domain=%s)", server_id, expected_domain)
+    else:
+        log.warning("❌ NOPE token FAILED for %s (domain=%s)", server_id, expected_domain)
+    return ok
+
+
+# ======================================================================================
+#         Shim תואם-לאחור: verify_nope_and_optional_zk — מאמת טוקן בלבד
+# ======================================================================================
+
+def verify_nope_and_optional_zk(server_id: str,
+                                expected_domain: str,
+                                server_public_key,
+                                token_path: PathLike | None = None,
+                                *_, **__) -> bool:
+    """
+    שמירה על תאימות לקוד ישן: מתעלם מכל פרמטרי ZK/נתיבי VK/Proofs/Env.
+    מבצע אך ורק אימות טוקן NOPE.
+    """
+    p = Path(token_path) if token_path else find_token_for_server(server_id)
+    if not p:
+        log.warning("Token for %s not found under %s", server_id, TOKENS_DIR)
+        return False
+    return verify_nope_token_file(p, server_id, expected_domain, server_public_key)
+
+
+__all__ = [
+    # legacy HMAC
+    "make_nope_proof", "verify_nope_proof",
+    # JSON token
+    "pubkey_fingerprint", "verify_nope_json",
+    # storage/lookup
+    "find_token_for_server", "verify_nope_token_file", "verify_peer_nope",
+    # shim
+    "verify_nope_and_optional_zk",
+]

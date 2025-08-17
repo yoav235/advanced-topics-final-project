@@ -1,20 +1,36 @@
 # init_nope.py
-import os
+"""
+יוצר טוקני NOPE חתומים במפתח ה-TLS עצמו, כך שהאימות יתבצע מול ה-public key שבתוך tls/cert.pem.
+
+תלויות:
+- tls/cert.pem + tls/key.pem (הריצו לפני כן: python init_tls.py)
+- ספריית היעד לטוקנים: nope/tokens
+
+פלט:
+- nope/tokens/S1.nope.json, S2.nope.json, S3.nope.json
+"""
+
 import json
 import base64
 import time
 from pathlib import Path
 
+from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-
 # ---- הגדרות ----
-SERVERS = ["S1", "S2", "S3"]         # ניתן להרחיב בהמשך
-KEYS_DIR = Path("keys")
-TOKENS_DIR = Path("nope") / "tokens"
+SERVERS = ["S1", "S2", "S3"]  # ניתן להרחיב בהמשך
+BASE_DIR = Path(__file__).resolve().parent
 
-# מיפוי דומיינים (בינתיים placeholder – תשנה בהמשך אם יש לכם מיפוי אמיתי)
+TLS_DIR  = BASE_DIR / "tls"
+TLS_CERT = TLS_DIR / "cert.pem"
+TLS_KEY  = TLS_DIR / "key.pem"
+
+TOKENS_DIR = BASE_DIR / "nope" / "tokens"
+TOKENS_DIR.mkdir(parents=True, exist_ok=True)
+
+# מיפוי דומיינים (placeholder – עדכנו אם יש לכם מיפוי אמיתי)
 DOMAIN_MAP = {
     "S1": "mix1.local",
     "S2": "mix2.local",
@@ -22,27 +38,28 @@ DOMAIN_MAP = {
 }
 
 
-def ensure_dirs():
-    KEYS_DIR.mkdir(parents=True, exist_ok=True)
-    TOKENS_DIR.mkdir(parents=True, exist_ok=True)
+# ---------- עזר ----------
+def load_tls_keypair():
+    """טוען את זוג המפתחות של TLS: מפתח פרטי + public מתוך התעודה."""
+    if not TLS_CERT.exists() or not TLS_KEY.exists():
+        raise FileNotFoundError(
+            f"TLS missing: expected {TLS_CERT} and {TLS_KEY}. Run init_tls.py first."
+        )
 
+    cert = x509.load_pem_x509_certificate(TLS_CERT.read_bytes())
+    tls_public_key = cert.public_key()
 
-def load_private_key(server_id: str):
-    priv_path = KEYS_DIR / f"{server_id}_priv.pem"
-    with priv_path.open("rb") as f:
-        return serialization.load_pem_private_key(f.read(), password=None)
-
-
-def load_public_key(server_id: str):
-    pub_path = KEYS_DIR / f"{server_id}_pub.pem"
-    with pub_path.open("rb") as f:
-        return serialization.load_pem_public_key(f.read())
+    tls_private_key = serialization.load_pem_private_key(
+        TLS_KEY.read_bytes(), password=None
+    )
+    return tls_private_key, tls_public_key
 
 
 def pubkey_fingerprint(public_key) -> str:
+    """SHA-256 fingerprint של SubjectPublicKeyInfo (DER)."""
     der = public_key.public_bytes(
         serialization.Encoding.DER,
-        serialization.PublicFormat.SubjectPublicKeyInfo
+        serialization.PublicFormat.SubjectPublicKeyInfo,
     )
     digest = hashes.Hash(hashes.SHA256())
     digest.update(der)
@@ -50,13 +67,10 @@ def pubkey_fingerprint(public_key) -> str:
 
 
 def sign_payload(private_key, payload_bytes: bytes) -> bytes:
-    # חתימה עם RSA-PSS + SHA256 (בחירה מומלצת)
+    """חתימה עם RSA-PSS + SHA256."""
     return private_key.sign(
         payload_bytes,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.MAX_LENGTH,
-        ),
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
         hashes.SHA256(),
     )
 
@@ -66,10 +80,7 @@ def verify_signature(public_key, payload_bytes: bytes, signature: bytes) -> bool
         public_key.verify(
             signature,
             payload_bytes,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH,
-            ),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
             hashes.SHA256(),
         )
         return True
@@ -77,90 +88,60 @@ def verify_signature(public_key, payload_bytes: bytes, signature: bytes) -> bool
         return False
 
 
-def make_nope_token(server_id: str) -> Path:
+# ---------- יצירה ואימות טוקן ----------
+def make_nope_token(server_id: str, tls_priv, tls_pub) -> Path:
     """
-    בונה טוקן NOPE לשרת נתון, חותם עליו ושומר אותו כ-JSON.
-    מחזיר את הנתיב לקובץ הטוקן.
+    בונה טוקן NOPE לשרת נתון:
+      - pubkey_fingerprint מחושב מהמפתח הציבורי של TLS
+      - חתימה נעשית עם המפתח הפרטי של TLS
     """
-    # טעינת מפתחות
-    priv = load_private_key(server_id)
-    pub = load_public_key(server_id)
-
-    # הכנת המטען (payload)
-    data = {
+    payload = {
         "server_id": server_id,
         "domain": DOMAIN_MAP.get(server_id, "localhost"),
-        "pubkey_fingerprint": pubkey_fingerprint(pub),
+        "pubkey_fingerprint": pubkey_fingerprint(tls_pub),
         "alg": "RSA-PSS-SHA256",
         "ts": int(time.time()),
-        # אפשר להוסיף בהמשך: dnssec_chain, nope_params וכו'
+        # בהמשך אפשר לצרף לכאן הוכחת ZK דחוסה/שרשרת DNSSEC וכד'
     }
-    payload_bytes = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    sig = sign_payload(tls_priv, payload_bytes)
 
-    # חתימה
-    sig = sign_payload(priv, payload_bytes)
     token_obj = {
-        "payload": data,
+        "payload": payload,
         "signature_b64": base64.b64encode(sig).decode("ascii"),
     }
 
-    # כתיבה לדיסק
     out_path = TOKENS_DIR / f"{server_id}.nope.json"
-    with out_path.open("w", encoding="utf-8") as f:
-        json.dump(token_obj, f, ensure_ascii=False, indent=2)
-
+    out_path.write_text(json.dumps(token_obj, ensure_ascii=False, indent=2), encoding="utf-8")
     return out_path
 
 
-def verify_nope_token(path: Path) -> bool:
-    """
-    מאמת טוקן NOPE לפי המפתח הציבורי של השרת שבתוך ה-payload (לפי server_id).
-    """
-    with path.open("r", encoding="utf-8") as f:
-        token = json.load(f)
-
+def verify_nope_token(path: Path, tls_pub) -> bool:
+    """אימות עצמי (sanity) מול המפתח הציבורי של TLS."""
+    token = json.loads(path.read_text(encoding="utf-8"))
     payload = token["payload"]
-    server_id = payload["server_id"]
-    signature = base64.b64decode(token["signature_b64"])
+    sig = base64.b64decode(token["signature_b64"])
 
-    # שחזור payload בתצורה מדויקת לחתימה
+    # fingerprint חייב להתאים ל-TLS public key
+    if payload.get("pubkey_fingerprint") != pubkey_fingerprint(tls_pub):
+        return False
+
     payload_bytes = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-    # טוענים מפתח ציבורי לאימות
-    pub = load_public_key(server_id)
-    return verify_signature(pub, payload_bytes, signature)
+    return verify_signature(tls_pub, payload_bytes, sig)
 
 
+# ---------- main ----------
 def main():
     print("[init_nope] Starting…")
-    ensure_dirs()
 
-    # בדיקה שהמפתחות קיימים
-    missing = []
+    tls_priv, tls_pub = load_tls_keypair()
+
     for sid in SERVERS:
-        if not (KEYS_DIR / f"{sid}_priv.pem").exists() or not (KEYS_DIR / f"{sid}_pub.pem").exists():
-            missing.append(sid)
-
-    if missing:
-        for sid in missing:
-            print(f"[init_nope] WARNING: missing keys for {sid} "
-                  f"(expected {KEYS_DIR / (sid + '_priv.pem')} and {KEYS_DIR / (sid + '_pub.pem')}). "
-                  f"Run generate_keys.py first.")
-        # לא מפסיקים את הריצה לגמרי – נמשיך עם אלה שכן קיימים.
-
-    # יצירה ואימות לכל שרת שיש לו מפתחות
-    for sid in SERVERS:
-        priv_exists = (KEYS_DIR / f"{sid}_priv.pem").exists()
-        pub_exists = (KEYS_DIR / f"{sid}_pub.pem").exists()
-        if not (priv_exists and pub_exists):
-            continue
-
-        out = make_nope_token(sid)
-        ok = verify_nope_token(out)
+        out = make_nope_token(sid, tls_priv, tls_pub)
+        ok = verify_nope_token(out, tls_pub)
         status = "Verified OK" if ok else "VERIFICATION FAILED"
         print(f"[init_nope] {sid}: wrote {out} -> {status}")
 
-    # סיכום קבצים
     print("\n[init_nope] Tokens folder content:")
     for p in sorted(TOKENS_DIR.glob("*.nope.json")):
         print(f" - {p} ({p.stat().st_size} bytes)")
