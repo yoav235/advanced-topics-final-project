@@ -8,6 +8,7 @@ to avoid 'Formatting field not found in record: server'.
 
 import logging
 import os
+import sys
 from typing import Optional
 
 _LEVELS = {
@@ -35,7 +36,7 @@ class _InjectServerFilter(logging.Filter):
             record.server = self.server_id
         return True
 
-def get_server_logger(server_id: str, *, name: Optional[str] = None) -> logging.Logger:
+def get_server_logger(server_id: str, *, name: Optional[str] = None) -> logging.LoggerAdapter:
     """
     Return a logger adapter bound to this server_id.
     Safe to call multiple times; won't duplicate handlers.
@@ -46,7 +47,8 @@ def get_server_logger(server_id: str, *, name: Optional[str] = None) -> logging.
     base.propagate = False
 
     if not base.handlers:
-        h = logging.StreamHandler()
+        # IMPORTANT: send logs to stdout to avoid PowerShell NativeCommandError on stderr
+        h = logging.StreamHandler(stream=sys.stdout)
         h.setLevel(_env_level())
         h.setFormatter(logging.Formatter(_FMT, datefmt="%Y-%m-%d %H:%M:%S"))
         h.addFilter(_InjectServerFilter(server_id))

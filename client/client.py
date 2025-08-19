@@ -72,17 +72,21 @@ class Client:
 
         return payload
 
-
+    # client/client.py  (replace the whole send_message with this)
     def send_message(self, message):
-        chosen_servers = random.sample(self.server_list, 3)
+        # deterministic path: S1 -> S2 -> S3 (ensures NOPE is enforced on both hops)
+        chosen_servers = sorted(self.server_list, key=lambda s: s.server_id)
         message_path = [s.server_id for s in chosen_servers]
-        payload = self.onion_encrypt(message, message_path)
-        # signed_message = sign_message_with_nope(payload, self.client_id)
-        # todo: which client receives the message
-        signed_message = payload
-        print(f"[Client {self.client_id}] Sending message to {self.server_list}: {message}")
 
+        payload = self.onion_encrypt(message, message_path)
+        # signed_message = sign_message_with_nope(payload, self.client_id)  # not used in this demo
+        signed_message = payload
+
+        print(f"[Client {self.client_id}] Sending message via path {message_path}: {message}")
         chosen_servers[0].receive_message(signed_message, self.client_id, use_tls=True)
+
+        # todo: which client receives the message
+
 
 # testing encryption
 if __name__ == "__main__":

@@ -1,29 +1,28 @@
 # server/mixnet_tls_transport.py
 # -*- coding: utf-8 -*-
 """
-Mixnet TLS Transport (NOPE-only):
----------------------------------
-שכבת תעבורה פשוטה שמבצעת TLS + אימות NOPE בלבד, בלי CA.
-- בצד השרת: מבקשים תעודת לקוח (mTLS), מבצעים TLS handshake, ואז מאמתים NOPE על ה-peer.
-- בצד הלקוח: מציגים תעודה, מתחברים, ומבצעים אימות NOPE על השרת.
+Mixnet TLS Transport (NOPE-only)
+--------------------------------
+A minimal transport layer that performs TLS + NOPE attestation only (no CA).
+- Server: requests a client certificate (mTLS), performs TLS handshake, then enforces NOPE on the peer.
+- Client: presents a certificate, connects, and enforces NOPE on the server.
 
-המודול מספק:
-- server_once(): מאזין לחיבור אחד, עושה אימות NOPE, מקבל בקשה ומחזיר תשובה.
-- client_request(): יוצר חיבור TLS, מאמת NOPE על השרת, שולח בקשה ומחזיר תשובה.
-- send_msg()/recv_msg(): פריימינג בינארי (אורך 4 בתים big-endian + גוף).
-- send_json()/recv_json(): סוכר ל-JSON מעל אותו פריימינג.
+This module provides:
+- server_once(): accept a single TLS connection, enforce NOPE, receive one request and send one reply.
+- client_request(): open a TLS connection, enforce NOPE, send one request and receive one reply.
+- send_msg()/recv_msg(): length-prefixed binary framing (4-byte big-endian length + body).
+- send_json()/recv_json(): JSON sugar over the same framing.
 
-כדי שהאימות יעבוד:
-- קבצי tls/cert.pem ו-tls/key.pem קיימים (init_tls.py כבר יוצר).
-- קבצי NOPE tokens נמצאים תחת nope/tokens/ (init_nope.py כבר יוצר).
-- server/nope_enforcer.py קיים (משתמש ב-server/nope_utils.py).
+Prerequisites:
+- Files tls/cert.pem and tls/key.pem exist (created by init_tls.py).
+- NOPE tokens live under nope/tokens/ (created by init_nope.py).
+- server/nope_enforcer.py is present (uses server/nope_utils.py).
 
-שימוש טיפוסי:
+Typical usage:
 
-    # שרת:
+    # Server:
     from server.mixnet_tls_transport import server_once
     def handler(body: bytes) -> bytes:
-        # כאן שמים את הלוגיקה של המיקס (פילטרים, ערבובים, וכו')
         return b"ACK:" + body
     reply = server_once(
         bind=("0.0.0.0", 9443),
@@ -32,7 +31,7 @@ Mixnet TLS Transport (NOPE-only):
         handle_request=handler,
     )
 
-    # לקוח:
+    # Client:
     from server.mixnet_tls_transport import client_request
     resp = client_request(
         remote=("127.0.0.1", 9443),
@@ -41,15 +40,17 @@ Mixnet TLS Transport (NOPE-only):
         payload=b"hello",
     )
 
-הערה: בדיפולט אנחנו מבצעים mTLS (השרת מבקש תעודה; הלקוח מציג).
+By default we do mTLS (server requests client cert; client presents).
 """
 
 from __future__ import annotations
+
 import json
+import logging
 import socket
 import struct
-import logging
-from typing import Tuple, Optional, Callable
+import time
+from typing import Callable, Optional, Tuple
 
 from server.tls_runtime import (
     make_server_context,
@@ -60,16 +61,26 @@ from server.tls_runtime import (
 
 log = logging.getLogger(__name__)
 
-# פריימינג: 4 בתים (big-endian) של האורך, ואז גוף ההודעה
+# Framing: 4-byte big-endian length prefix, then the message body.
 _LEN = struct.Struct(">I")
-_MAX_MSG = 1 << 20  # 1MB מקסימום להודעה (ניתן להתאים לפי צרכי המיקס)
+_MAX_MSG = 1 << 20  # 1 MiB max message size (tweak as needed)
+
+__all__ = [
+    "send_msg",
+    "recv_msg",
+    "send_json",
+    "recv_json",
+    "server_once",
+    "client_request",
+]
+
 
 # -----------------------------
-# פריימינג בינארי ו-JSON
+# Binary framing & JSON helpers
 # -----------------------------
 
 def send_msg(sock: socket.socket, body: bytes) -> None:
-    """שולח הודעה עם כותרת אורך (4 בתים) + גוף."""
+    """Send a single message with a 4-byte length prefix followed by the body."""
     if not isinstance(body, (bytes, bytearray, memoryview)):
         raise TypeError("body must be bytes-like")
     if len(body) > _MAX_MSG:
@@ -78,7 +89,7 @@ def send_msg(sock: socket.socket, body: bytes) -> None:
 
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
-    """קורא בדיוק n בתים או זורק חריגה אם הסשן נסגר לפני הזמן."""
+    """Receive exactly n bytes or raise if the peer closes early."""
     buf = bytearray(n)
     view = memoryview(buf)
     got = 0
@@ -91,7 +102,7 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def recv_msg(sock: socket.socket) -> bytes:
-    """מקבל הודעה עם פריימינג (4 בתים אורך + גוף)."""
+    """Receive one framed message (4-byte length + body)."""
     header = recv_exact(sock, _LEN.size)
     (length,) = _LEN.unpack(header)
     if length > _MAX_MSG:
@@ -110,7 +121,7 @@ def recv_json(sock: socket.socket):
 
 
 # -----------------------------
-# API צד שרת
+# Server-side API
 # -----------------------------
 
 def server_once(
@@ -123,30 +134,33 @@ def server_once(
     timeout: Optional[float] = 10.0,
 ) -> bytes:
     """
-    מאזין לחיבור יחיד:
-      1) יוצר הקשר TLS לשרת (מבקש תעודת לקוח אם request_client_cert=True)
-      2) עושה TLS handshake
-      3) מאמת NOPE על ה-peer (expected_peer_id/domain)
-      4) קורא בקשה אחת, מפעיל handle_request (אם נתון), ושולח תשובה
-    מחזיר את התשובה שנשלחה (לנוחות בדיקות).
+    Accept a single TLS connection:
+      1) build server TLS context (requesting client cert if request_client_cert=True)
+      2) perform TLS handshake
+      3) enforce NOPE on the peer (expected_peer_id/domain)
+      4) read one request, pass through handle_request (if provided), and send a single reply
+
+    Returns the bytes reply (useful in tests).
     """
     ctx = make_server_context(request_client_cert=request_client_cert)
+
     ssock, addr = accept_once_with_nope(
-        bind, ctx,
+        bind,
+        ctx,
         expected_peer_id=expected_peer_id,
         expected_domain=expected_domain,
         enforce=True,
         timeout=timeout,
     )
-    # אם הגענו לכאן — ה-NOPE עבר בהצלחה
+    # If we are here, NOPE is already enforced successfully.
     try:
         req = recv_msg(ssock)
         if handle_request:
             resp = handle_request(req)
             if not isinstance(resp, (bytes, bytearray, memoryview)):
-                raise TypeError("handle_request() must return bytes")
+                raise TypeError("handle_request() must return bytes-like")
         else:
-            # דיפולט: echo
+            # default: echo
             resp = req
         send_msg(ssock, resp)
         return bytes(resp)
@@ -158,8 +172,14 @@ def server_once(
 
 
 # -----------------------------
-# API צד לקוח
+# Client-side API
 # -----------------------------
+
+def _is_conn_refused_oserror(err: OSError) -> bool:
+    """Return True if the OSError represents a connection refused condition."""
+    # Windows: 10061, Linux: 111
+    return isinstance(err, ConnectionRefusedError) or getattr(err, "errno", None) in (10061, 111)
+
 
 def client_request(
     remote: Tuple[str, int],
@@ -169,25 +189,56 @@ def client_request(
     payload: bytes | bytearray | memoryview,
     present_client_cert: bool = True,
     timeout: Optional[float] = 5.0,
+    connect_attempts: int = 10,
+    connect_delay: float = 0.05,
 ) -> bytes:
     """
-    שולח בקשה אחת ומחזיר תשובה:
-      1) יוצר הקשר TLS ללקוח (מציג תעודה אם present_client_cert=True)
-      2) עושה TLS handshake
-      3) מאמת NOPE על השרת (expected_peer_id/domain)
-      4) שולח payload ומקבל תשובה אחת
+    Send one request and receive one reply:
+      1) build client TLS context (present client cert if present_client_cert=True)
+      2) perform TLS handshake (with small retries to absorb startup races)
+      3) enforce NOPE on the server (expected_peer_id/domain)
+      4) send payload and receive a single reply
     """
     if not isinstance(payload, (bytes, bytearray, memoryview)):
         raise TypeError("payload must be bytes-like")
 
     ctx = make_client_context(present_client_cert=present_client_cert)
-    ss = connect_with_nope(
-        remote, ctx,
-        expected_peer_id=expected_peer_id,
-        expected_domain=expected_domain,
-        enforce=True,
-        timeout=timeout,
-    )
+
+    # Small connection retry loop to avoid races where the peer listener thread
+    # has bound the port but is not yet accepting connections.
+    last_exc: Optional[BaseException] = None
+    for attempt in range(1, max(1, connect_attempts) + 1):
+        try:
+            ss = connect_with_nope(
+                remote,
+                ctx,
+                expected_peer_id=expected_peer_id,
+                expected_domain=expected_domain,
+                enforce=True,
+                timeout=timeout,
+            )
+            break  # success
+        except OSError as e:
+            if _is_conn_refused_oserror(e) and attempt < connect_attempts:
+                if attempt == 1:
+                    log.warning(
+                        "TLS connect to %s:%s refused; will retry up to %d times (%.0f ms interval).",
+                        remote[0], remote[1], connect_attempts, connect_delay * 1000.0
+                    )
+                time.sleep(connect_delay)
+                last_exc = e
+                continue
+            # Any other OSError (or exhausted retries) -> re-raise
+            raise
+        except Exception as e:
+            # Non-OSError exceptions (e.g., NOPE enforcement failures) should not be retried here.
+            raise
+    else:
+        # Should not reach here, but keep a safeguard.
+        if last_exc is not None:
+            raise last_exc  # pragma: no cover
+        raise RuntimeError("connect_with_nope failed unexpectedly")  # pragma: no cover
+
     try:
         send_msg(ss, payload)
         resp = recv_msg(ss)
@@ -200,13 +251,13 @@ def client_request(
 
 
 # -----------------------------
-# דוגמת שימוש (אופציונלי)
+# Demo (optional)
 # -----------------------------
 if __name__ == "__main__":
-    # הרצה ידנית לבדיקת עשן:
-    # טרמינל 1:  python -m server.mixnet_tls_transport server
-    # טרמינל 2:  python -m server.mixnet_tls_transport client
-    import sys, threading, time
+    # Manual smoke test:
+    # Terminal 1:  python -m server.mixnet_tls_transport server
+    # Terminal 2:  python -m server.mixnet_tls_transport client
+    import sys
 
     def _demo_handler(b: bytes) -> bytes:
         return b"ACK:" + b
@@ -222,7 +273,6 @@ if __name__ == "__main__":
         print("Server handled one request.")
     elif len(sys.argv) >= 2 and sys.argv[1] == "client":
         print("Starting demo client to 127.0.0.1:9443 (expects S2@mix2.local)...")
-        # שימו לב: בדמו הזה זה סתם ערכים — התאימו לשרשרת היעד שלכם
         r = client_request(
             ("127.0.0.1", 9443),
             expected_peer_id="S2",

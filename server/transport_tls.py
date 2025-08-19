@@ -6,17 +6,19 @@ TLS transport for inter-server hops, with NOPE enforcement on the sender side.
 
 from __future__ import annotations
 
+import json
 import logging
 import socket
 import ssl
 import struct
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
 from .server_logging import get_server_logger
-from .nope_enforcer import verify_peer_on_socket
+from .nope_enforcer import verify_peer_on_socket, expected_domain_for
 
 
 def _port_for(server_id: str) -> int:
@@ -41,25 +43,21 @@ def _recv_exact(sock: ssl.SSLSocket, n: int) -> bytes:
 class TLSPeerTransport:
     server_id: str
 
-    # accept both naming styles (compat)
     tls_cert: Optional[Path] = None
     tls_key: Optional[Path] = None
     cert_path: Optional[Path] = None
     key_path: Optional[Path] = None
 
-    # NEW: where to look for NOPE tokens (e.g., nope/tokens)
     tokens_dir: Optional[Path] = None
 
     host: str = "127.0.0.1"
     logger: Optional[logging.Logger] = None
 
-    # internal
     _listen_thread: Optional[threading.Thread] = field(default=None, init=False)
     _stop_event: threading.Event = field(default_factory=threading.Event, init=False)
     _on_message: Optional[Callable[[bytes], None]] = field(default=None, init=False)
 
     def __post_init__(self) -> None:
-        # logger adapter with {server: ...}
         if self.logger is None:
             self.log = get_server_logger(self.server_id, "mixnet.server")
         else:
@@ -68,7 +66,6 @@ class TLSPeerTransport:
             else:
                 self.log = self.logger
 
-        # normalize cert/key paths; support both param names
         cp = self.cert_path or self.tls_cert
         kp = self.key_path or self.tls_key
         if not cp or not kp:
@@ -76,7 +73,6 @@ class TLSPeerTransport:
         self.cert_path = Path(cp)
         self.key_path = Path(kp)
 
-        # normalize tokens_dir if provided
         if self.tokens_dir is not None:
             self.tokens_dir = Path(self.tokens_dir)
 
@@ -102,19 +98,31 @@ class TLSPeerTransport:
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE  # our auth is NOPE, not CA
 
+            t0 = time.perf_counter()
             with socket.create_connection(addr, timeout=timeout) as raw:
                 with ctx.wrap_socket(raw, server_hostname=self.host) as ssock:
+                    t_hs = time.perf_counter()
+                    dom = expected_domain_for(peer_id, fallback=None)
                     ok = verify_peer_on_socket(
                         ssock,
                         server_id=peer_id,
                         mode="return_false",
-                        tokens_dir=self.tokens_dir,  # <-- pass through
+                        tokens_dir=self.tokens_dir,
+                        expected_domain=dom,
                     )
+                    t_nv = time.perf_counter()
                     if not ok:
-                        self.log.warning("🚫 TLS denied for %s: invalid/missing NOPE.", peer_id)
+                        self.log.warning("TLS denied for %s: invalid/missing NOPE (domain=%s).", peer_id, dom or "n/a")
                         return False
                     hdr = struct.pack(">I", len(payload))
                     ssock.sendall(hdr + payload)
+                    self.log.debug(
+                        "hop=%s timings: tls=%.1fms, nope=%.1fms, total=%.1fms",
+                        peer_id,
+                        (t_hs - t0) * 1e3,
+                        (t_nv - t_hs) * 1e3,
+                        (time.perf_counter() - t0) * 1e3,
+                    )
                     return True
         except Exception as e:
             self.log.warning("Forward TLS send to %s failed: %s", peer_id, e)

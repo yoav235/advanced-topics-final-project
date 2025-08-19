@@ -112,11 +112,11 @@ class MixServer:
             self.log.warning("Forward TLS send to %s failed: %s", nxt, e)
 
     # ---------------------------------------------------------------------
-    # Callback מה-transport כשמגיעה הודעה TLS משרת אחר
+    # Callback from transport when a TLS message arrives from a peer
     # ---------------------------------------------------------------------
-    def _on_tls_message(self, data: bytes, peer_id: str) -> None:
+    def _on_tls_message(self, data: bytes) -> None:
         """
-        נקראת ע"י TLSPeerTransport כאשר מגיעה הודעה TLS מ-peer (שכבר עבר אימות NOPE שם).
+        Called by TLSPeerTransport when a TLS-framed message arrives from a peer.
         """
         try:
             text = data.decode("utf-8", errors="replace")
@@ -125,11 +125,11 @@ class MixServer:
 
         nxt = self._next_hop()
         if nxt is None:
-            # זה hop אחרון (S3) – "מסירה" למקבל
+            # last hop (S3) — deliver
             self._deliver_final(text)
             return
 
-        # אחרת, ממשיכים להעביר ל-hop הבא
+        # otherwise forward to next hop over TLS (NOPE enforced in transport.send)
         try:
             self.transport.send(nxt, text.encode("utf-8"))
         except Exception as e:

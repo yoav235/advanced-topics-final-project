@@ -137,7 +137,12 @@ def pubkey_fingerprint(public_key) -> str:
 
 
 def verify_nope_json(token_obj: dict, expected_sid: str, expected_domain: str, server_public_key) -> bool:
-    """אימות טוקן JSON חתום RSA-PSS-SHA256."""
+    """אימות טוקן JSON חתום RSA-PSS-SHA256, כולל בדיקת טריות (ts/exp) אופציונלית.
+       ניתן לקבוע מקס' גיל בשניות דרך env: NOPE_TOKEN_MAX_AGE_SEC (ברירת מחדל 90 יום).
+       אם יש payload['exp'] – נבדוק אותו; אחרת אם יש 'ts' – נבדוק now-ts <= max_age.
+       אם אין ts/exp – לא נפיל, כדי לשמור תאימות לאחור.
+    """
+    import os, time
     try:
         payload = token_obj["payload"]
         sig_b64 = token_obj["signature_b64"]
@@ -158,6 +163,19 @@ def verify_nope_json(token_obj: dict, expected_sid: str, expected_domain: str, s
             padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
             hashes.SHA256(),
         )
+
+        # --- freshness ---
+        max_age = int(os.environ.get("NOPE_TOKEN_MAX_AGE_SEC", str(90 * 24 * 3600)))
+        now = int(time.time())
+        exp = payload.get("exp")
+        ts  = payload.get("ts")
+        if isinstance(exp, int):
+            if now > exp:
+                return False
+        elif isinstance(ts, int) and max_age > 0:
+            if now - ts > max_age:
+                return False
+
         return True
     except Exception:
         return False
@@ -234,9 +252,9 @@ def verify_peer_nope(server_id: str,
         return False
     ok = verify_nope_token_file(token_path, server_id, expected_domain, server_public_key)
     if ok:
-        log.info("✅ NOPE token OK for %s (domain=%s)", server_id, expected_domain)
+        log.info("NOPE token OK for %s (domain=%s)", server_id, expected_domain)
     else:
-        log.warning("❌ NOPE token FAILED for %s (domain=%s)", server_id, expected_domain)
+        log.warning("NOPE token FAILED for %s (domain=%s)", server_id, expected_domain)
     return ok
 
 
