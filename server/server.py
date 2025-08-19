@@ -1,151 +1,142 @@
 # server/server.py
-import os
-import base64
-import json
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional
 import logging
-from typing import Optional
 
-from cryptography.hazmat.primitives import serialization, hashes
-from cryptography.hazmat.primitives.asymmetric import padding
+from .transport_tls import TLSPeerTransport
+from .server_logging import get_server_logger
 
-import crypto_utils
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-TLS_DIR = os.environ.get("TLS_DIR", "tls")
-TLS_CERT_PATH = os.path.join(TLS_DIR, "cert.pem")
-TLS_KEY_PATH  = os.path.join(TLS_DIR, "key.pem")
-
-NOPE_DIR     = os.environ.get("NOPE_DIR", "nope")
-NOPE_TOKENS  = os.path.join(NOPE_DIR, "tokens")  # e.g., S1.nope.json
-KEYS_DIR     = os.environ.get("KEYS_DIR", "keys")
-
-# חשוב: ליישר לדומיינים ש-init_nope.py יצר (mix1.local/2/3)
-SERVER_DOMAINS = {"S1": "mix1.local", "S2": "mix2.local", "S3": "mix3.local"}
-
-
-def _load_pubkey(server_id: str):
-    path = os.path.join(KEYS_DIR, f"{server_id}_pub.pem")
-    with open(path, "rb") as f:
-        return serialization.load_pem_public_key(f.read())
-
-
-def _pub_fingerprint(pub) -> str:
-    der = pub.public_bytes(
-        serialization.Encoding.DER,
-        serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-    h = hashes.Hash(hashes.SHA256())
-    h.update(der)
-    return h.finalize().hex()
-
-
+@dataclass
 class MixServer:
-    # רג’יסטרי גלובלי כדי שנוכל למצוא את השרת הבא לפי מזהה
-    REGISTRY: dict[str, "MixServer"] = {}
+    """
+    שרת מיקס מינימלי המדגים:
+    - האזנה ב-TLS (עם cert/key מקומיים)
+    - שליחת הודעות TLS לשרת הבא
+    - אכיפת NOPE מתבצעת בשכבת ה-TLSPeerTransport בזמן ה-handshake
+    - לוגים עם LoggerAdapter שמספק תמיד extra['server'] כדי למנוע שגיאות formatter
+    """
+    server_id: str
 
-    def __init__(self, server_id, server_list: Optional[list] = None, num_clients: int = 2):
-        self.server_id = server_id
-        self.server_list = {"S1": "S1", "S2": "S2", "S3": "S3"}  # לוגי בלבד בסימולציה הזו
-        self.num_clients = num_clients
-        self.next_server = None
+    # נתיבי TLS וקבצי NOPE (ברירות מחדל יחסיות לשורש הפרויקט)
+    tls_cert: Path = Path("tls/cert.pem")
+    tls_key: Path = Path("tls/key.pem")
+    tokens_dir: Path = Path("nope/tokens")
 
-        # רישום ברג’יסטרי
-        MixServer.REGISTRY[self.server_id] = self
+    # כתובת הקשבה מקומית
+    host: str = "127.0.0.1"
 
-        # מפתחות
-        self.private_key = crypto_utils.load_private_keys([server_id])[server_id]
-        self.public_key  = crypto_utils.load_public_key(server_id)
+    # פנימיים
+    transport: TLSPeerTransport = field(init=False)
+    log: logging.LoggerAdapter = field(init=False)
+    _started: bool = field(default=False, init=False)
 
-        # TLS (דיווח בלבד כרגע)
+    def __post_init__(self) -> None:
+        # logger עם extra {'server': <server_id>} כדי להתאים לפורמט הלוג הכללי
+        self.log = get_server_logger(self.server_id)
+
+        # ודא נתיבים (יחסיים לקובץ הרצה)
+        self.tls_cert = Path(self.tls_cert)
+        self.tls_key = Path(self.tls_key)
+        self.tokens_dir = Path(self.tokens_dir)
+
+        # בנה transport עם הלוגר של השרת הזה
+        self.transport = TLSPeerTransport(
+            server_id=self.server_id,
+            tls_cert=self.tls_cert,
+            tls_key=self.tls_key,
+            tokens_dir=self.tokens_dir,
+            host=self.host,
+            logger=self.log,  # חשוב: כדי שלוגים פנימיים ב-transport יהיו עם extra['server']
+        )
+
+        # אתחול מיידי (כמו שהיה במקור אצלך)
+        self.start()
+
+    # ---------------------------------------------------------------------
+    # Lifecycle
+    # ---------------------------------------------------------------------
+    def start(self) -> None:
+        if self._started:
+            return
+        # חיווי למשתמש על קבצי TLS ונתיב טוקנים
+        self.log.info("TLS files found (cert=%s, key=%s)", str(self.tls_cert).replace("\\", "/"), str(self.tls_key).replace("\\", "/"))
+        self.log.info("NOPE: expecting tokens in '%s'", str(self.tokens_dir).replace("\\", "/"))
+
+        # הפעלת האזנת TLS; הקולבק יקבל bytes + מזהה-peer
+        self.transport.start(self._on_tls_message)
+        self._started = True
+
+    def stop(self) -> None:
+        if not self._started:
+            return
         try:
-            with open(TLS_CERT_PATH, "rb") as cert_file:
-                self.cert = cert_file.read()
-            with open(TLS_KEY_PATH, "rb") as key_file:
-                self.key = key_file.read()
-            logging.info(f"[Server {self.server_id}] TLS files found (cert={TLS_CERT_PATH}, key={TLS_KEY_PATH})")
-        except FileNotFoundError:
-            logging.warning(f"[Server {self.server_id}] TLS files missing. NOPE will still be required for TLS.")
-            self.cert = self.key = None
+            self.transport.stop()
+        finally:
+            self._started = False
 
-        logging.info(f"[Server {self.server_id}] NOPE: expecting tokens in '{NOPE_TOKENS}'")
+    # ---------------------------------------------------------------------
+    # Routing (דמו נתיבי S1->S2->S3)
+    # ---------------------------------------------------------------------
+    def _next_hop(self) -> Optional[str]:
+        """בחירה דטרמיניסטית פשוטה למסלול ההדגמה: S1→S2→S3 (ו-S3 הוא hop אחרון)."""
+        if self.server_id == "S1":
+            return "S2"
+        if self.server_id == "S2":
+            return "S3"
+        return None  # S3 הוא האחרון
 
-    # --- אימות NOPE ---
-    def _verify_sender_nope(self, sender_id: str) -> bool:
+    # ---------------------------------------------------------------------
+    # API שהלקוח קורא אליה ישירות על ה-hop הראשון (ללא אכיפת NOPE בצד השרת הראשון)
+    # ---------------------------------------------------------------------
+    def receive_message(self, ciphertext: str, origin_client_id: str, use_tls: bool = True) -> None:
         """
-        לקוחות (C*) – דולג בהופ הראשון.
-        שרתים (S*) – מאומתים נגד הטוקן שלהם ב-nope/tokens/S*.nope.json
-          (פורמט JSON חתום RSA-PSS כפי שמייצר init_nope.py).
+        קריאה "מלקוח" אל השרת הראשון בשרשרת.
+        בדמו: מדלגים על NOPE ב-hop הראשון (כי המקור הוא לקוח), ומעבירים הלאה ב-TLS ל-hop הבא.
         """
-        if not sender_id.startswith("S"):
-            logging.info(f"[Server {self.server_id}] Origin is client {sender_id} -> skipping NOPE on first hop.")
-            return True
+        self.log.info("Origin is client %s -> skipping NOPE on first hop.", origin_client_id)
 
-        tok_path = os.path.join(NOPE_TOKENS, f"{sender_id}.nope.json")
-        if not os.path.exists(tok_path):
-            logging.warning(f"[Server {self.server_id}] Missing NOPE token for {sender_id} at {tok_path}")
-            return False
+        nxt = self._next_hop()
+        if not nxt:
+            # אם במקרה S3 קיבל ישירות מהלקוח – נמסור כיעד סופי
+            self._deliver_final(ciphertext)
+            return
 
-        # אימות החתימה ושדות ה-payload
+        # מעבירים הלאה ב-TLS; ה-TLSPeerTransport יוודא NOPE על היעד
         try:
-            with open(tok_path, "r", encoding="utf-8") as f:
-                token = json.load(f)
-            payload = token["payload"]
-            sig_b64 = token["signature_b64"]
-            domain_expected = SERVER_DOMAINS.get(sender_id)
-            if payload.get("server_id") != sender_id or payload.get("domain") != domain_expected:
-                return False
-
-            sender_pub = _load_pubkey(sender_id)
-            if payload.get("pubkey_fingerprint") != _pub_fingerprint(sender_pub):
-                return False
-
-            msg = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-            signature = base64.b64decode(sig_b64)
-            sender_pub.verify(
-                signature,
-                msg,
-                padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
-                hashes.SHA256(),
-            )
-            return True
+            self.transport.send(nxt, ciphertext.encode("utf-8"))
         except Exception as e:
-            logging.warning(f"[Server {self.server_id}] ❌ NOPE verification failed for {sender_id}: {e}")
-            return False
+            self.log.warning("Forward TLS send to %s failed: %s", nxt, e)
 
-    # --- קבלת הודעה והעברה להופ הבא ---
-    def receive_message(self, message_b64: str, sender_id: str, use_tls: bool = True):
-        # אכיפת NOPE על מקור החיבור
-        if use_tls and not self._verify_sender_nope(sender_id):
-            logging.warning(f"[Server {self.server_id}] 🚫 TLS denied for {sender_id}: invalid/missing NOPE.")
-            return
-        if use_tls and sender_id.startswith("S"):
-            logging.info(f"[Server {self.server_id}] 🔐 TLS accepted from {sender_id} (NOPE OK).")
-
-        # פענוח שכבת הבצל לשרת הנוכחי
+    # ---------------------------------------------------------------------
+    # Callback מה-transport כשמגיעה הודעה TLS משרת אחר
+    # ---------------------------------------------------------------------
+    def _on_tls_message(self, data: bytes, peer_id: str) -> None:
+        """
+        נקראת ע"י TLSPeerTransport כאשר מגיעה הודעה TLS מ-peer (שכבר עבר אימות NOPE שם).
+        """
         try:
-            decrypted = crypto_utils.decrypt_hybrid(self.private_key, base64.b64decode(message_b64))
-            data = json.loads(decrypted.decode("utf-8"))
+            text = data.decode("utf-8", errors="replace")
+        except Exception:
+            text = repr(data)
+
+        nxt = self._next_hop()
+        if nxt is None:
+            # זה hop אחרון (S3) – "מסירה" למקבל
+            self._deliver_final(text)
+            return
+
+        # אחרת, ממשיכים להעביר ל-hop הבא
+        try:
+            self.transport.send(nxt, text.encode("utf-8"))
         except Exception as e:
-            logging.error(f"[Server {self.server_id}] Failed to decrypt/parse message: {e}")
-            return
+            self.log.warning("Forward TLS send to %s failed: %s", nxt, e)
 
-        # data חייב להכיל: {"from": client_id, "next": <S* או 'DEST'>, "payload": <base64|dict>}
-        nxt = data.get("next")
-        inner_payload = data.get("payload")
-        if nxt == "DEST":
-            logging.info(f"[Server {self.server_id}] 🎉 Final destination reached. Message: {inner_payload}")
-            return
-
-        # שלח להופ הבא (S*) – כאן האכיפה תהיה S→S
-        next_server = MixServer.REGISTRY.get(nxt)
-        if not next_server:
-            logging.error(f"[Server {self.server_id}] Next hop '{nxt}' not found in registry.")
-            return
-
-        if not isinstance(inner_payload, str):
-            logging.error(f"[Server {self.server_id}] Inner payload is not base64 string.")
-            return
-
-        # העברה: השולח כעת הוא השרת הנוכחי
-        next_server.receive_message(inner_payload, sender_id=self.server_id, use_tls=True)
+    # ---------------------------------------------------------------------
+    # "מסירה" סופית (לוג בלבד בדמו)
+    # ---------------------------------------------------------------------
+    def _deliver_final(self, text: str) -> None:
+        self.log.info('Delivered to final hop: "%s"', text)
