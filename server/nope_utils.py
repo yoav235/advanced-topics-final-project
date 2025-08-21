@@ -135,10 +135,10 @@ def pubkey_fingerprint(public_key) -> str:
     digest.update(der)
     return digest.finalize().hex()
 
-
+# todo: write again!
 def verify_nope_json(token_obj: dict, expected_sid: str, expected_domain: str, server_public_key) -> bool:
     """אימות טוקן JSON חתום RSA-PSS-SHA256, כולל בדיקת טריות (ts/exp) אופציונלית.
-       ניתן לקבוע מקס' גיל בשניות דרך env: NOPE_TOKEN_MAX_AGE_SEC (ברירת מחדל 90 יום).
+       ניתן לקבוע מקס' תוק בשניות דרך env: NOPE_TOKEN_MAX_AGE_SEC (ברירת מחדל 90 יום).
        אם יש payload['exp'] – נבדוק אותו; אחרת אם יש 'ts' – נבדוק now-ts <= max_age.
        אם אין ts/exp – לא נפיל, כדי לשמור תאימות לאחור.
     """
@@ -187,6 +187,8 @@ def verify_nope_json(token_obj: dict, expected_sid: str, expected_domain: str, s
 
 PathLike = Union[str, Path]
 
+
+# todo: we need to certificate by another parameters (timestamp, CA name)
 def verify_nope_token_file(token_path: PathLike,
                            server_id: str,
                            expected_domain: str,

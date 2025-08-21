@@ -41,7 +41,7 @@ def verify_nope_with_snarkjs(proof_dict: dict, vk_path="nope/rsa-ecdsa-vk.json")
 
         shutil.copy("nope/rsa-ecdsa_public.json", public_path)
 
-        cmd = cmd = ["npx.cmd", "snarkjs", "groth16", "verify", vk_path, public_path, proof_path]
+        cmd = ["npx.cmd", "snarkjs", "groth16", "verify", vk_path, public_path, proof_path]
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         return "OK" in result.stdout

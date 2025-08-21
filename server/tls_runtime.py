@@ -132,64 +132,65 @@ def make_client_context(
 # Context builders (מחמיר – mTLS + CA/anchor)
 # --------------------------
 
-def make_server_context_strict(
-    cert_path: pathlib.Path | str = CERT_PATH,
-    key_path:  pathlib.Path | str = KEY_PATH,
-    *,
-    cafile: pathlib.Path | str = CERT_PATH,   # עוגן אמון (למשל self-signed anchor מ-NOPE)
-) -> ssl.SSLContext:
-    """
-    שרת TLS מחמיר: דורש תעודת לקוח (CERT_REQUIRED) ומאמת אותה מול CA/anchor.
-    """
-    cert_path = pathlib.Path(cert_path)
-    key_path  = pathlib.Path(key_path)
-    cafile    = pathlib.Path(cafile)
-    if not cert_path.exists() or not key_path.exists():
-        raise FileNotFoundError(f"missing TLS materials under {TLS_DIR} (cert.pem/key.pem)")
-    if not cafile.exists():
-        raise FileNotFoundError(f"missing trust anchor: {cafile}")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(str(cert_path), str(key_path))
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.set_ciphers("HIGH:!aNULL:!eNULL:!MD5:!RC4")
-    ctx.verify_mode = ssl.CERT_REQUIRED
-    ctx.load_verify_locations(cafile=str(cafile))
-    return ctx
-
-
-def make_client_context_strict(
-    *,
-    cert_path: pathlib.Path | str = CERT_PATH,
-    key_path:  pathlib.Path | str = KEY_PATH,
-    cafile:    pathlib.Path | str = CERT_PATH,  # עוגן האמון לשרת
-    present_client_cert: bool = True,
-) -> ssl.SSLContext:
-    """
-    לקוח TLS מחמיר: מאמת את השרת מול העוגן, ואופציונלית מציג תעודת לקוח (mTLS).
-    """
-    cafile = pathlib.Path(cafile)
-    if not cafile.exists():
-        raise FileNotFoundError(f"missing trust anchor: {cafile}")
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.set_ciphers("HIGH:!aNULL:!eNULL:!MD5:!RC4")
-    ctx.check_hostname = False               # אין לנו DNS SAN; נאמת מול העוגן/פינינג
-    ctx.verify_mode = ssl.CERT_REQUIRED
-    ctx.load_verify_locations(cafile=str(cafile))
-
-    if present_client_cert:
-        cert_path = pathlib.Path(cert_path)
-        key_path  = pathlib.Path(key_path)
-        if not cert_path.exists() or not key_path.exists():
-            raise FileNotFoundError(f"missing client cert/key under {TLS_DIR}")
-        ctx.load_cert_chain(str(cert_path), str(key_path))
-    return ctx
+# def make_server_context_strict(
+#     cert_path: pathlib.Path | str = CERT_PATH,
+#     key_path:  pathlib.Path | str = KEY_PATH,
+#     *,
+#     cafile: pathlib.Path | str = CERT_PATH,   # עוגן אמון (למשל self-signed anchor מ-NOPE)
+# ) -> ssl.SSLContext:
+#     """
+#     שרת TLS מחמיר: דורש תעודת לקוח (CERT_REQUIRED) ומאמת אותה מול CA/anchor.
+#     """
+#     cert_path = pathlib.Path(cert_path)
+#     key_path  = pathlib.Path(key_path)
+#     cafile    = pathlib.Path(cafile)
+#     if not cert_path.exists() or not key_path.exists():
+#         raise FileNotFoundError(f"missing TLS materials under {TLS_DIR} (cert.pem/key.pem)")
+#     if not cafile.exists():
+#         raise FileNotFoundError(f"missing trust anchor: {cafile}")
+#     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+#     ctx.load_cert_chain(str(cert_path), str(key_path))
+#     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+#     ctx.set_ciphers("HIGH:!aNULL:!eNULL:!MD5:!RC4")
+#     ctx.verify_mode = ssl.CERT_REQUIRED
+#     ctx.load_verify_locations(cafile=str(cafile))
+#     return ctx
+#
+#
+# def make_client_context_strict(
+#     *,
+#     cert_path: pathlib.Path | str = CERT_PATH,
+#     key_path:  pathlib.Path | str = KEY_PATH,
+#     cafile:    pathlib.Path | str = CERT_PATH,  # עוגן האמון לשרת
+#     present_client_cert: bool = True,
+# ) -> ssl.SSLContext:
+#     """
+#     לקוח TLS מחמיר: מאמת את השרת מול העוגן, ואופציונלית מציג תעודת לקוח (mTLS).
+#     """
+#     cafile = pathlib.Path(cafile)
+#     if not cafile.exists():
+#         raise FileNotFoundError(f"missing trust anchor: {cafile}")
+#     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+#     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+#     ctx.set_ciphers("HIGH:!aNULL:!eNULL:!MD5:!RC4")
+#     ctx.check_hostname = False               # אין לנו DNS SAN; נאמת מול העוגן/פינינג
+#     ctx.verify_mode = ssl.CERT_REQUIRED
+#     ctx.load_verify_locations(cafile=str(cafile))
+#
+#     if present_client_cert:
+#         cert_path = pathlib.Path(cert_path)
+#         key_path  = pathlib.Path(key_path)
+#         if not cert_path.exists() or not key_path.exists():
+#             raise FileNotFoundError(f"missing client cert/key under {TLS_DIR}")
+#         ctx.load_cert_chain(str(cert_path), str(key_path))
+#     return ctx
 
 
 # --------------------------
 # Pinning helpers (אופציונלי)
 # --------------------------
 
+# todo: understand these 2 functions
 def _pem_fingerprint(pem_path: str, algo: str = "sha256") -> str:
     """מחזיר fingerprint (hex) של תעודת PEM לפי האלגוריתם הנתון (sha256 כברירת מחדל)."""
     pem = pathlib.Path(pem_path).read_text(encoding="utf-8")
@@ -214,6 +215,7 @@ def listen_tcp(bind: Tuple[str, int]) -> socket.socket:
     return srv
 
 
+# todo: is it really uses NOPE verification?
 def accept_once_with_nope(
     bind: Tuple[str, int],
     server_ctx: ssl.SSLContext,
@@ -250,36 +252,36 @@ def accept_once_with_nope(
             raise
 
 
-def accept_once_mtls(
-    bind: Tuple[str, int],
-    server_ctx: ssl.SSLContext,
-    *,
-    expected_peer_fingerprint: str | None = None,
-    expected_peer_cert_path: pathlib.Path | str | None = CERT_PATH,
-    timeout: float | None = 10.0,
-) -> Tuple[ssl.SSLSocket, Tuple[str, int]]:
-    """
-    מאזין פעם אחת (TLS מחמיר). אופציונלית מצמיד (pin) את תעודת הלקוח לפי fingerprint.
-    """
-    with listen_tcp(bind) as ls:
-        ls.settimeout(timeout)
-        conn, addr = ls.accept()
-    ssock = server_ctx.wrap_socket(conn, server_side=True)
-    try:
-        if expected_peer_fingerprint or expected_peer_cert_path:
-            peer_der = ssock.getpeercert(binary_form=True)
-            got_fp = _der_fingerprint(peer_der)
-            exp_fp = expected_peer_fingerprint or _pem_fingerprint(str(expected_peer_cert_path))
-            if got_fp.lower() != exp_fp.lower():
-                raise ssl.SSLError(
-                    f"peer certificate fingerprint mismatch (got {got_fp}, expected {exp_fp})"
-                )
-        return ssock, addr
-    except Exception:
-        try:
-            ssock.close()
-        finally:
-            raise
+# def accept_once_mtls(
+#     bind: Tuple[str, int],
+#     server_ctx: ssl.SSLContext,
+#     *,
+#     expected_peer_fingerprint: str | None = None,
+#     expected_peer_cert_path: pathlib.Path | str | None = CERT_PATH,
+#     timeout: float | None = 10.0,
+# ) -> Tuple[ssl.SSLSocket, Tuple[str, int]]:
+#     """
+#     מאזין פעם אחת (TLS מחמיר). אופציונלית מצמיד (pin) את תעודת הלקוח לפי fingerprint.
+#     """
+#     with listen_tcp(bind) as ls:
+#         ls.settimeout(timeout)
+#         conn, addr = ls.accept()
+#     ssock = server_ctx.wrap_socket(conn, server_side=True)
+#     try:
+#         if expected_peer_fingerprint or expected_peer_cert_path:
+#             peer_der = ssock.getpeercert(binary_form=True)
+#             got_fp = _der_fingerprint(peer_der)
+#             exp_fp = expected_peer_fingerprint or _pem_fingerprint(str(expected_peer_cert_path))
+#             if got_fp.lower() != exp_fp.lower():
+#                 raise ssl.SSLError(
+#                     f"peer certificate fingerprint mismatch (got {got_fp}, expected {exp_fp})"
+#                 )
+#         return ssock, addr
+#     except Exception:
+#         try:
+#             ssock.close()
+#         finally:
+#             raise
 
 
 # --------------------------

@@ -95,6 +95,7 @@ def verify_peer_on_socket(
         if dom is None:
             dom = _domain_from_token_file(Path(tok), _fallback_domain_for_sid(server_id))
         # final fallback
+        # todo: why do we need the fallback if not None?
         dom = dom or _fallback_domain_for_sid(server_id)
 
         ok = verify_nope_token_file(tok, server_id, dom, peer_pub)
