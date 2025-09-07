@@ -234,6 +234,28 @@ def accept_once_with_nope(
         ls.settimeout(timeout)
         conn, addr = ls.accept()
     ssock = server_ctx.wrap_socket(conn, server_side=True)
+
+    # --- NEW: בדיקת NOPE-ZK על תעודת הצד השני (אם הופעלה בסביבה) ---
+    try:
+        from server.nope_zk import maybe_enforce_on_peer_cert, NopeZKError
+        peer_der = ssock.getpeercert(binary_form=True)
+        if peer_der:
+            from cryptography import x509
+            from cryptography.hazmat.primitives import serialization
+            cert = x509.load_der_x509_certificate(peer_der)
+            pem = cert.public_bytes(serialization.Encoding.PEM)
+            def _log(msg: str):
+                import logging; logging.getLogger("tls_nope_smoke").info(msg)
+            maybe_enforce_on_peer_cert(pem, log_func=_log)
+    except NopeZKError:
+        try:
+            ssock.close()
+        finally:
+            raise
+    except Exception as _e:
+        import logging; logging.getLogger("tls_nope_smoke").warning("ZK/NOPE check error: %s", _e)
+    # --- END NEW ---
+
     try:
         if expected_peer_id:
             ok = verify_peer_on_socket(
@@ -250,6 +272,7 @@ def accept_once_with_nope(
             ssock.close()
         finally:
             raise
+
 
 
 # def accept_once_mtls(
@@ -305,6 +328,28 @@ def connect_with_nope(
     host, port = remote
     s = socket.create_connection((host, port), timeout=timeout)
     ss = client_ctx.wrap_socket(s, server_hostname=host if client_ctx.check_hostname else None)
+
+    # --- NEW: בדיקת NOPE-ZK על תעודת השרת (אם הופעלה בסביבה) ---
+    try:
+        from server.nope_zk import maybe_enforce_on_peer_cert, NopeZKError
+        peer_der = ss.getpeercert(binary_form=True)
+        if peer_der:
+            from cryptography import x509
+            from cryptography.hazmat.primitives import serialization
+            cert = x509.load_der_x509_certificate(peer_der)
+            pem = cert.public_bytes(serialization.Encoding.PEM)
+            def _log(msg: str):
+                import logging; logging.getLogger("tls_nope_smoke").info(msg)
+            maybe_enforce_on_peer_cert(pem, log_func=_log)
+    except NopeZKError:
+        try:
+            ss.close()
+        finally:
+            raise
+    except Exception as _e:
+        import logging; logging.getLogger("tls_nope_smoke").warning("ZK/NOPE check error: %s", _e)
+    # --- END NEW ---
+
     try:
         if expected_peer_id:
             ok = verify_peer_on_socket(
@@ -321,6 +366,7 @@ def connect_with_nope(
             ss.close()
         finally:
             raise
+
 
 
 def connect_mtls(
