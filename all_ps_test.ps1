@@ -13,7 +13,8 @@ function Run-Cmd([string]$label, [string]$exe, [string[]]$argList){
   $tmpOut = [System.IO.Path]::GetTempFileName()
   $tmpErr = [System.IO.Path]::GetTempFileName()
   try {
-    $p = Start-Process -FilePath $exe -ArgumentList $argList -NoNewWindow -Wait -PassThru -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
+    $p = Start-Process -FilePath $exe -Argumen
+    tList $argList -NoNewWindow -Wait -PassThru -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
     $out = Get-Content $tmpOut -Raw
     $err = Get-Content $tmpErr -Raw
   } catch {
