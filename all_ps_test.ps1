@@ -69,7 +69,7 @@ function Check-CertHasNope {
 function Pause-At-End{ Write-Host ""; Write-Host "Done. Press ENTER to continue..." -ForegroundColor Yellow; Read-Host | Out-Null }
 
 # --- sanity: must run in project root ---
-$need = @("requirements.txt","server","init_tls.py","init_nope.py","simulate.py","test_mixnet.py","nope-verifier.py")
+$need = @("requirements.txt","server","init_tls.py","init_nope.py","simulate.py","nope-verifier.py")
 $missing = @(); foreach($n in $need){ if(-not (Test-Path $n)){ $missing += $n } }
 if($missing.Count -gt 0){ Fail ("Please cd into the project root. Missing: " + ($missing -join ", ")); Pause-At-End; return }
 
