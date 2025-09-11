@@ -58,6 +58,7 @@ from server.tls_runtime import (
     accept_once_with_nope,
     connect_with_nope,
 )
+from server.nope_enforcer import expected_domain_for
 
 log = logging.getLogger(__name__)
 
@@ -83,13 +84,16 @@ def send_msg(sock: socket.socket, body: bytes) -> None:
     """Send a single message with a 4-byte length prefix followed by the body."""
     if not isinstance(body, (bytes, bytearray, memoryview)):
         raise TypeError("body must be bytes-like")
-    if len(body) > _MAX_MSG:
+    n = len(body)
+    if n < 0 or n > _MAX_MSG:
         raise ValueError(f"message too large (>{_MAX_MSG} bytes)")
-    sock.sendall(_LEN.pack(len(body)) + body)
+    sock.sendall(_LEN.pack(n) + body)
 
 
-def recv_exact(sock: socket.socket, n: int) -> bytes:
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
     """Receive exactly n bytes or raise if the peer closes early."""
+    if n < 0:
+        raise ValueError("negative length not allowed")
     buf = bytearray(n)
     view = memoryview(buf)
     got = 0
@@ -103,11 +107,11 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
 
 def recv_msg(sock: socket.socket) -> bytes:
     """Receive one framed message (4-byte length + body)."""
-    header = recv_exact(sock, _LEN.size)
+    header = _recv_exact(sock, _LEN.size)
     (length,) = _LEN.unpack(header)
-    if length > _MAX_MSG:
+    if length < 0 or length > _MAX_MSG:
         raise ValueError(f"declared length too large ({length} > {_MAX_MSG})")
-    return recv_exact(sock, length)
+    return _recv_exact(sock, length)
 
 
 def send_json(sock: socket.socket, obj) -> None:
@@ -144,17 +148,43 @@ def server_once(
     """
     ctx = make_server_context(request_client_cert=request_client_cert)
 
-    ssock, addr = accept_once_with_nope(
-        bind,
-        ctx,
-        expected_peer_id=expected_peer_id,
-        expected_domain=expected_domain,
-        enforce=True,
-        timeout=timeout,
-    )
-    # If we are here, NOPE is already enforced successfully.
+    # Resolve domain precedence (expected_domains.json > explicit arg > token > mixN.local)
+    dom = expected_domain
+    if expected_peer_id:
+        dom = dom or expected_domain_for(expected_peer_id, fallback=None)
+
+    # Enforce NOPE at accept time; if it fails, print a canonical DENY line.
     try:
-        req = recv_msg(ssock)
+        ssock, addr = accept_once_with_nope(
+            bind,
+            ctx,
+            expected_peer_id=expected_peer_id,
+            expected_domain=dom,
+            enforce=True,
+            timeout=timeout,
+        )
+    except Exception:
+        # Canonical line used by tests and diagnostics:
+        print(
+            f"DENY peer_id={expected_peer_id or 'unknown'} "
+            f"domain={dom or 'unknown'} reason=nope-verify-failed",
+            flush=True,
+        )
+        raise
+
+    # If we are here, NOPE is already enforced successfully (when expected_peer_id is provided).
+    try:
+        try:
+            req = recv_msg(ssock)
+        except Exception:
+            # If peer tears down after NOPE failure on their side, surface a clear DENY as well.
+            print(
+                f"DENY peer_id={expected_peer_id or 'unknown'} "
+                f"domain={dom or 'unknown'} reason=nope-verify-failed",
+                flush=True,
+            )
+            raise
+
         if handle_request:
             resp = handle_request(req)
             if not isinstance(resp, (bytes, bytearray, memoryview)):
@@ -201,8 +231,14 @@ def client_request(
     """
     if not isinstance(payload, (bytes, bytearray, memoryview)):
         raise TypeError("payload must be bytes-like")
+    if not expected_peer_id:
+        # for client-side we *must* know who we expect to talk to
+        raise ValueError("expected_peer_id is required on client_request()")
 
     ctx = make_client_context(present_client_cert=present_client_cert)
+
+    # Resolve domain precedence (expected_domains.json > explicit arg > token > mixN.local)
+    dom = expected_domain or expected_domain_for(expected_peer_id, fallback=None)
 
     # Small connection retry loop to avoid races where the peer listener thread
     # has bound the port but is not yet accepting connections.
@@ -213,7 +249,7 @@ def client_request(
                 remote,
                 ctx,
                 expected_peer_id=expected_peer_id,
-                expected_domain=expected_domain,
+                expected_domain=dom,
                 enforce=True,
                 timeout=timeout,
             )
@@ -230,8 +266,12 @@ def client_request(
                 continue
             # Any other OSError (or exhausted retries) -> re-raise
             raise
-        except Exception as e:
-            # Non-OSError exceptions (e.g., NOPE enforcement failures) should not be retried here.
+        except Exception:
+            # Non-OSError exceptions (e.g., NOPE enforcement failures).
+            print(
+                f"DENY peer_id={expected_peer_id} domain={dom or 'unknown'} reason=nope-verify-failed",
+                flush=True,
+            )
             raise
     else:
         # Should not reach here, but keep a safeguard.
@@ -240,8 +280,16 @@ def client_request(
         raise RuntimeError("connect_with_nope failed unexpectedly")  # pragma: no cover
 
     try:
-        send_msg(ss, payload)
-        resp = recv_msg(ss)
+        try:
+            send_msg(ss, payload)
+            resp = recv_msg(ss)
+        except Exception:
+            # If server denies (e.g., because *its* NOPE check failed), make denial explicit in logs.
+            print(
+                f"DENY peer_id={expected_peer_id} domain={dom or 'unknown'} reason=nope-verify-failed",
+                flush=True,
+            )
+            raise
         return resp
     finally:
         try:

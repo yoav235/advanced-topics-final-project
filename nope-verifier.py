@@ -14,7 +14,7 @@ from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.x509.oid import ObjectIdentifier
 
-# OID בו מוטמן ה-proof בתעודה (תואם generate_tls.py)
+# OID שבו מוטמן ה-proof בתעודה (תואם generate_tls.py)
 NOPE_OID = ObjectIdentifier("1.3.6.1.4.1.55555.1.1")
 
 # קבצי ברירת מחדל ל-public inputs ו-verification key
@@ -39,19 +39,31 @@ def _load_cert_from_file(path: str | Path) -> x509.Certificate:
     return _load_cert_from_bytes(data)
 
 def _check_tls_validity(cert: x509.Certificate) -> bool:
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    return cert.not_valid_before <= now <= cert.not_valid_after
+    """
+    אימות תוקף התעודה בשעון UTC, תוך שימוש במאפיינים *_utc החדשים
+    כדי להימנע מהתראות deprecation.
+    """
+    now = datetime.now(timezone.utc)
+    try:
+        nvb = cert.not_valid_before_utc
+        nva = cert.not_valid_after_utc
+    except AttributeError:
+        # תאימות לאחור (ספריות ישנות יותר) — נשווה מול not_valid_* הישנים עם aware now
+        nvb = cert.not_valid_before.replace(tzinfo=timezone.utc)
+        nva = cert.not_valid_after.replace(tzinfo=timezone.utc)
+    return nvb <= now <= nva
 
 def _extract_nope_proof(cert: x509.Certificate) -> Optional[dict]:
     """
     מחלץ JSON של הוכחה מתוך הרחבת ה-OID.
-    ב-generate_tls.py שמרתם מחרוזת JSON, ולכן נפענח כ-utf-8.
+    ב-generate_tls.py שמרתם מחרוזת JSON, לכן נפענח כ-utf-8.
     """
     try:
         ext = cert.extensions.get_extension_for_oid(NOPE_OID)
-        raw = ext.value.value  # bytes
+        raw = ext.value.value  # bytes (UnrecognizedExtension)
         if isinstance(raw, (bytes, bytearray)):
-            return json.loads(raw.decode("utf-8"))
+            txt = raw.decode("utf-8", errors="strict")
+            return json.loads(txt)
         if isinstance(raw, str):
             return json.loads(raw)
         return None
@@ -59,13 +71,17 @@ def _extract_nope_proof(cert: x509.Certificate) -> Optional[dict]:
         return None
 
 # ---------- הרצת snarkjs ----------
-def _pick_npx() -> str:
+def _pick_npx() -> Optional[str]:
     """
-    החזרת המפעיל המתאים ל-npx בכל מערכת.
+    מאתר npx (גם ב-Windows). מחזיר נתיב או None אם לא נמצא.
+    ניתן לעקוף עם משתנה סביבה NOPE_NPX.
     """
+    env = os.environ.get("NOPE_NPX")
+    if env:
+        return env
     if platform.system().lower().startswith("win"):
-        return shutil.which("npx.cmd") or "npx.cmd"
-    return shutil.which("npx") or "npx"
+        return shutil.which("npx.cmd")
+    return shutil.which("npx")
 
 def verify_nope_proof_with_snarkjs(
     proof_dict: dict,
@@ -75,9 +91,12 @@ def verify_nope_proof_with_snarkjs(
 ) -> bool:
     """
     snarkjs groth16 verify <vk> <public> <proof>
-    מחזיר True כשהאימות הצליח.
+    מחזיר True כשהאימות הצליח. מחזיר False אם snarkjs לא זמין או אם האימות נכשל.
     """
     npx = _pick_npx()
+    if not npx:
+        # npx/snarkjs לא זמין ב-PATH — נחזיר False (הקריאה העוטפת תחליט מה לעשות)
+        return False
 
     with tempfile.TemporaryDirectory() as tmpd:
         tmpd = Path(tmpd)
@@ -86,9 +105,7 @@ def verify_nope_proof_with_snarkjs(
 
         proof_path.write_text(json.dumps(proof_dict), encoding="utf-8")
 
-        if not public_inputs.exists():
-            return False
-        if not vkey_path.exists():
+        if not public_inputs.exists() or not vkey_path.exists():
             return False
         shutil.copy2(public_inputs, public_path)
 
@@ -102,7 +119,7 @@ def verify_nope_proof_with_snarkjs(
                 env={**os.environ, **(extra_env or {})},
             )
         except FileNotFoundError:
-            # npx/snarkjs לא זמין ב-PATH
+            # npx/snarkjs לא זמין בזמן ריצה
             return False
 
         out = f"{res.stdout or ''}\n{res.stderr or ''}"
@@ -173,12 +190,17 @@ def _main_cli() -> int:
     args = ap.parse_args()
 
     try:
-        ok = verify_nope_cert_file(args.cert, enforce=args.enforce,
-                                   public_inputs=Path(args.public), vkey_path=Path(args.vk))
-        print("✅ NOPE ZK verification OK" if ok else "❌ NOPE ZK verification FAILED")
+        ok = verify_nope_cert_file(
+            args.cert,
+            enforce=args.enforce,
+            public_inputs=Path(args.public),
+            vkey_path=Path(args.vk),
+        )
+        # שומרים פלט ASCII פשוט כדי להימנע מבעיות קונסול/קוד־דף
+        print("OK: NOPE ZK verification passed" if ok else "FAIL: NOPE ZK verification failed")
         return 0 if ok else 1
     except NopeVerifyError as e:
-        print(f"❌ {e}")
+        print(f"FAIL: {e}")
         return 2
 
 if __name__ == "__main__":
