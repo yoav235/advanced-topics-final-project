@@ -281,7 +281,7 @@ def accept_once_with_nope(
                 ssock,
                 server_id=expected_peer_id,
                 expected_domain=expected_domain or "mix.local",
-                mode="raise" if enforce else "return",
+                mode="raise" if enforce else "return_false",  # FIX
             )
             if not ok and enforce:
                 raise RuntimeError("NOPE peer verification failed")
@@ -323,7 +323,7 @@ def connect_with_nope(
                 ss,
                 server_id=expected_peer_id,
                 expected_domain=expected_domain or "mix.local",
-                mode="raise" if enforce else "return",
+                mode="raise" if enforce else "return_false",  # FIX
             )
             if not ok and enforce:
                 raise RuntimeError("NOPE server verification failed")

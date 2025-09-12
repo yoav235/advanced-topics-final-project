@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 import logging
 
 from .transport_tls import TLSPeerTransport
@@ -38,7 +38,7 @@ class MixServer:
         # logger עם extra {'server': <server_id>} כדי להתאים לפורמט הלוג הכללי
         self.log = get_server_logger(self.server_id)
 
-        # ודא נתיבים (יחסיים לקובץ הרצה)
+        # ודא נתיבים (יחסיים לשורש)
         self.tls_cert = Path(self.tls_cert)
         self.tls_key = Path(self.tls_key)
         self.tokens_dir = Path(self.tokens_dir)
@@ -50,7 +50,7 @@ class MixServer:
             tls_key=self.tls_key,
             tokens_dir=self.tokens_dir,
             host=self.host,
-            logger=self.log,  # חשוב: כדי שלוגים פנימיים ב-transport יהיו עם extra['server']
+            logger=self.log,  # חשוב: לוגים פנימיים עם extra['server']
         )
 
         # אתחול מיידי (כמו שהיה במקור אצלך)
@@ -63,10 +63,15 @@ class MixServer:
         if self._started:
             return
         # חיווי למשתמש על קבצי TLS ונתיב טוקנים
-        self.log.info("TLS files found (cert=%s, key=%s)", str(self.tls_cert).replace("\\", "/"), str(self.tls_key).replace("\\", "/"))
+        self.log.info(
+            "TLS files found (cert=%s, key=%s)",
+            str(self.tls_cert).replace("\\", "/"),
+            str(self.tls_key).replace("\\", "/"),
+        )
         self.log.info("NOPE: expecting tokens in '%s'", str(self.tokens_dir).replace("\\", "/"))
+        self.log.info("Bind host: %s", self.host)
 
-        # הפעלת האזנת TLS; הקולבק יקבל bytes + מזהה-peer
+        # הפעלת האזנת TLS; הקולבק יקבל bytes
         self.transport.start(self._on_tls_message)
         self._started = True
 
